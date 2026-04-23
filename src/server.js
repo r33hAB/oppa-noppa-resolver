@@ -116,22 +116,74 @@ app.get('/stream/:token', async (req, reply) => {
   if (req.headers.range) forwardHeaders.Range = req.headers.range;
 
   const upstream = await fetch(tok.url, { headers: forwardHeaders, redirect: 'follow' });
-  // Hoist relevant headers onto the response. We strip hop-by-hop stuff
-  // that fetch's body stream may break, and pass through content-range
-  // which is essential for video seeking.
   const ct = upstream.headers.get('content-type') ?? 'application/octet-stream';
   reply.code(upstream.status);
+
+  // HLS manifest? Rewrite every inner URL (segments, keys, subtitle
+  // tracks) to point back through our /stream proxy so downstream
+  // fetches also get the Referer header injected. Without this, Safari
+  // fires direct requests to pro.ultracloud.cc and gets 403s.
+  const isManifest = /application\/(vnd\.apple\.mpegurl|x-mpegurl)/i.test(ct) ||
+    /\.m3u8(\?|$)/i.test(tok.url);
+  if (isManifest) {
+    const body = await upstream.text();
+    const proto = req.headers['x-forwarded-proto'] ?? req.protocol;
+    const host = req.headers['x-forwarded-host'] ?? req.headers.host;
+    const selfBase = `${proto}://${host}`;
+    const rewritten = rewriteHlsManifest(body, tok.url, tok.referer, selfBase);
+    reply.header('content-type', 'application/vnd.apple.mpegurl');
+    reply.header('cache-control', 'public, max-age=30');
+    return reply.send(rewritten);
+  }
+
   reply.header('content-type', ct);
   const passthrough = ['content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'];
   for (const h of passthrough) {
     const v = upstream.headers.get(h);
     if (v) reply.header(h, v);
   }
-  // Short CDN cache for manifest/segments — helps repeat viewers, low risk
-  // of staleness because tokens are 10-min TTL anyway.
   reply.header('cache-control', 'public, max-age=60');
   return reply.send(upstream.body);
 });
+
+/**
+ * Rewrite an HLS manifest so every inner URL (segments, AES keys,
+ * subtitle playlists, nested variant manifests) routes back through
+ * our /stream proxy. This preserves the same signed-token semantics
+ * — each rewritten URL gets its own short-lived token binding the
+ * inner URL + the right Referer.
+ *
+ * We re-sign because the client never sees the upstream URLs, which
+ * is what we want (no direct hits to the CDN from Safari). The Referer
+ * is the same one the parent manifest was fetched with, so all inner
+ * requests arrive at the CDN with the header it expects.
+ */
+function rewriteHlsManifest(body, parentUrl, referer, selfBase) {
+  const parent = new URL(parentUrl);
+  const resolveInner = (raw) => {
+    try {
+      // Handle relative URIs by resolving against the parent manifest.
+      const absolute = new URL(raw, parent).toString();
+      const token = signStreamToken({ url: absolute, referer });
+      return `${selfBase}/stream/${token}`;
+    } catch {
+      return raw;
+    }
+  };
+
+  const lines = body.split(/\r?\n/);
+  return lines.map((line) => {
+    // Blank lines pass through.
+    if (!line) return line;
+    // Any tag that embeds a URI=... inline: rewrite the quoted URI.
+    // Covers #EXT-X-KEY, #EXT-X-MEDIA, #EXT-X-I-FRAME-STREAM-INF, etc.
+    if (line.startsWith('#')) {
+      return line.replace(/URI="([^"]+)"/g, (_m, uri) => `URI="${resolveInner(uri)}"`);
+    }
+    // Non-tag lines are segment/playlist URIs.
+    return resolveInner(line);
+  }).join('\n');
+}
 
 /**
  * AniList passthrough. Lets the PWA hit us (same-origin through CF) for
