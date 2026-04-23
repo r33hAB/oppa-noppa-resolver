@@ -38,7 +38,11 @@ const SIGNING_SECRET = process.env.SIGNING_SECRET
 
 const TOKEN_TTL_SEC = 60 * 10; // 10 min — covers reasonable episode watch time
 
-const app = Fastify({ logger: true, bodyLimit: 1024 * 1024 });
+// maxParamLength defaults to 100 and silently 404s longer path params.
+// Our stream tokens are ~400 chars (base64url + HMAC), so bump the cap.
+// 4096 is well over any reasonable token length and well under any
+// router-tree memory concerns.
+const app = Fastify({ logger: true, bodyLimit: 1024 * 1024, maxParamLength: 4096 });
 
 await app.register(cors, {
   origin: (origin, cb) => {
