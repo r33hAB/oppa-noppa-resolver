@@ -1,0 +1,22 @@
+{
+  "name": "oppa-noppa-resolver",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Stream-URL resolver for Oppa Noppa mobile. Runs a Playwright scraper against miruro.to and hands short-lived signed stream URLs to the PWA.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "postinstall": "playwright install --with-deps chromium || playwright install chromium"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "fastify": "^5.2.1",
+    "@fastify/cors": "^10.0.2",
+    "@fastify/rate-limit": "^10.2.2",
+    "playwright-chromium": "^1.50.1"
+  }
+}

@@ -1,0 +1,15 @@
+# Railway deploy config — used automatically when this repo is linked
+# as a service. Explicit here so Railway doesn't guess wrong.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+# Chromium takes ~3s to warm on cold start; give the health probe
+# enough headroom that Railway doesn't mark the deploy unhealthy
+# while the browser initializes on the first request.
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
