@@ -17,8 +17,10 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import { resolveMiruro } from './scrapers/miruro.js';
 import { fetchAniList } from './anilist.js';
+import { startSession, readPlaylist, getSegmentPath, stopSession, ffmpegVersion } from './transcoder.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -64,7 +66,7 @@ await app.register(rateLimit, {
  * Health check — Railway pings this. Must stay cheap and dependency-free;
  * don't touch the scraper or AniList from here.
  */
-app.get('/health', async () => ({ ok: true, ts: Date.now() }));
+app.get('/health', async () => ({ ok: true, ts: Date.now(), ffmpeg: await ffmpegVersion() }));
 
 /**
  * Signed stream-URL generator. Response body is JSON with `url` that the
@@ -184,6 +186,86 @@ function rewriteHlsManifest(body, parentUrl, referer, selfBase) {
     return resolveInner(line);
   }).join('\n');
 }
+
+/**
+ * Transcoded-session flow. Use this instead of /resolve for browser
+ * playback — the upstream HLS uses HE-AACv2 audio which Chrome + Firefox
+ * MSE can't decode. This endpoint spawns a long-running ffmpeg that
+ * re-muxes audio to LC-AAC; returns a playlist URL the PWA hands to
+ * hls.js or <video src>.
+ *
+ * Flow:
+ *   1. POST /session/start?anilistId=&ep=&dub= → resolves upstream m3u8
+ *      via Playwright, spawns ffmpeg, waits for first segment, returns
+ *      { sessionId, playlistUrl }.
+ *   2. GET /session/:id/playlist.m3u8 → ffmpeg's own output, served
+ *      straight from disk. Never cached at the edge (growing VOD).
+ *   3. GET /session/:id/seg<N>.ts → segments ffmpeg has written so far.
+ *      Range-supported by createReadStream's native Fastify adapter.
+ *   4. POST /session/:id/stop → best-effort early teardown. Otherwise
+ *      the idle reaper kills it after 5 minutes of no reads.
+ */
+app.post('/session/start', async (req, reply) => {
+  const q = req.query;
+  const anilistId = Number(q.anilistId);
+  const ep = Number(q.ep);
+  const dub = String(q.dub) === 'true';
+  if (!Number.isInteger(anilistId) || anilistId <= 0) return reply.code(400).send({ error: 'bad anilistId' });
+  if (!Number.isInteger(ep) || ep <= 0) return reply.code(400).send({ error: 'bad ep' });
+
+  let tapped;
+  try {
+    tapped = await resolveMiruro({ anilistId, ep, dub });
+  } catch (err) {
+    req.log.error({ err: err.message }, 'scrape failed');
+    return reply.code(502).send({ error: 'scrape failed', detail: err.message });
+  }
+  if (!tapped) return reply.code(404).send({ error: 'no playable source' });
+
+  let session;
+  try {
+    session = await startSession({ upstreamUrl: tapped.url });
+  } catch (err) {
+    req.log.error({ err: err.message }, 'session start failed');
+    return reply.code(502).send({ error: 'transcoder failed', detail: err.message });
+  }
+
+  const proto = req.headers['x-forwarded-proto'] ?? req.protocol;
+  const host = req.headers['x-forwarded-host'] ?? req.headers.host;
+  return {
+    sessionId: session.id,
+    playlistUrl: `${proto}://${host}/session/${session.id}/playlist.m3u8`,
+  };
+});
+
+app.get('/session/:id/playlist.m3u8', async (req, reply) => {
+  const body = await readPlaylist(req.params.id);
+  if (body == null) return reply.code(404).send('no such session');
+  reply.header('content-type', 'application/vnd.apple.mpegurl');
+  // Don't cache — playlist grows segment-by-segment while ffmpeg runs.
+  reply.header('cache-control', 'no-store');
+  return reply.send(body);
+});
+
+app.get('/session/:id/:segment', async (req, reply) => {
+  const { id, segment } = req.params;
+  const path = getSegmentPath(id, segment);
+  if (!path) return reply.code(404).send('no such session or segment');
+  try {
+    reply.header('content-type', 'video/mp2t');
+    reply.header('accept-ranges', 'bytes');
+    reply.header('cache-control', 'public, max-age=3600');
+    return reply.send(createReadStream(path));
+  } catch (err) {
+    req.log.error({ err: err.message }, 'segment read failed');
+    return reply.code(502).send({ error: 'segment read failed' });
+  }
+});
+
+app.post('/session/:id/stop', async (req, reply) => {
+  stopSession(req.params.id);
+  return reply.send({ ok: true });
+});
 
 /**
  * AniList passthrough. Lets the PWA hit us (same-origin through CF) for

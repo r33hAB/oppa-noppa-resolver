@@ -8,6 +8,14 @@ FROM mcr.microsoft.com/playwright:v1.50.1-jammy
 
 WORKDIR /app
 
+# ffmpeg is used by the transcode-session pipeline (src/transcoder.js)
+# to re-mux HE-AACv2 audio to LC-AAC. Ubuntu's packaged ffmpeg is
+# recent enough (4.4+) for our -hls_playlist_type event + AES-128 HLS
+# inputs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy manifest first so Docker layer cache hits when only src changes.
 COPY package.json ./
 
