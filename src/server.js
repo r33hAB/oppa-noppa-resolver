@@ -94,21 +94,30 @@ app.get('/resolve', async (req, reply) => {
     const resolved = await resolveChain({ anilistId, ep, dub, log: req.log });
     if (!resolved) return reply.code(404).send({ error: 'no playable source' });
 
+    const proto = req.headers['x-forwarded-proto'] ?? req.protocol;
+    const host = req.headers['x-forwarded-host'] ?? req.headers.host;
+
     if (resolved.provider === 'animenexus') {
-      // Manifest is publicly accessible; no signed proxy needed.
+      // We previously returned the bare api.anime.nexus URL here, but
+      // anime.nexus doesn't send Access-Control-Allow-Origin for our
+      // PWA origin (their CORS only allows https://anime.nexus). The
+      // browser blocks the manifest fetch. Route through our signed
+      // /stream proxy instead — same path miruro takes — so the
+      // anime.nexus origin never sees the browser at all.
+      const ANIMENEXUS_REFERER = 'https://anime.nexus/';
+      const selfBase = `${proto}://${host}`;
+      const token = signStreamToken({ url: resolved.directUrl, referer: ANIMENEXUS_REFERER });
       return {
-        url: resolved.directUrl,
+        url: `${selfBase}/stream/${token}`,
         provider: 'animenexus',
         audioLanguages: resolved.audioLanguages,
-        subtitles: resolved.subtitles,
+        subtitles: wrapSubtitles(resolved.subtitles, ANIMENEXUS_REFERER, selfBase),
         expiresAt: Date.now() + TOKEN_TTL_SEC * 1000,
       };
     }
 
     // Miruro — sign and serve through our Referer-injecting proxy.
     const token = signStreamToken({ url: resolved.upstreamUrl, referer: resolved.referer ?? '' });
-    const proto = req.headers['x-forwarded-proto'] ?? req.protocol;
-    const host = req.headers['x-forwarded-host'] ?? req.headers.host;
     return {
       url: `${proto}://${host}/stream/${token}`,
       provider: 'miruro',
@@ -260,17 +269,25 @@ app.post('/session/start', async (req, reply) => {
   if (!resolved) return reply.code(404).send({ error: 'no playable source' });
 
   // anime.nexus serves Opus-in-fMP4 that the browser can play directly;
-  // no ffmpeg session needed. We still return the same shape the mobile
-  // client expects so the existing watch flow doesn't care which
-  // provider won. Empty sessionId means "no teardown needed"; the
-  // client's /session/:id/stop call is a safe no-op for that.
+  // no ffmpeg session needed. BUT we can't hand back the bare
+  // api.anime.nexus URL — they don't send Access-Control-Allow-Origin
+  // for our PWA origin and the manifest fetch gets CORS-blocked.
+  // Route the manifest through our /stream signed proxy (same path
+  // miruro takes); the rewriter will re-sign every inner segment +
+  // subtitle URI so the browser only ever talks to us. Empty
+  // sessionId still means "no ffmpeg teardown needed".
   if (!resolved.needsTranscode) {
+    const proto = req.headers['x-forwarded-proto'] ?? req.protocol;
+    const host = req.headers['x-forwarded-host'] ?? req.headers.host;
+    const selfBase = `${proto}://${host}`;
+    const ANIMENEXUS_REFERER = 'https://anime.nexus/';
+    const token = signStreamToken({ url: resolved.directUrl, referer: ANIMENEXUS_REFERER });
     return {
       sessionId: '',
-      playlistUrl: resolved.directUrl,
+      playlistUrl: `${selfBase}/stream/${token}`,
       provider: resolved.provider,
       audioLanguages: resolved.audioLanguages,
-      subtitles: resolved.subtitles,
+      subtitles: wrapSubtitles(resolved.subtitles, ANIMENEXUS_REFERER, selfBase),
     };
   }
 
@@ -416,6 +433,26 @@ app.post('/auth/anilist/exchange', async (req, reply) => {
 });
 
 /* ---- helpers ---- */
+
+/**
+ * Take whatever shape the scraper handed us for subtitles (either an
+ * array of plain URL strings or `{url, language, name}` objects) and
+ * rewrite each track's URL through our signed /stream proxy so the
+ * browser doesn't blow up on CORS when fetching the .vtt/.ass file
+ * directly from assets.anime.nexus.
+ */
+function wrapSubtitles(subs, referer, selfBase) {
+  if (!Array.isArray(subs)) return [];
+  return subs.map((s) => {
+    const url = typeof s === 'string' ? s : s?.url;
+    if (!url) return s;
+    const token = signStreamToken({ url, referer });
+    const proxied = `${selfBase}/stream/${token}`;
+    return typeof s === 'string'
+      ? proxied
+      : { ...s, url: proxied };
+  });
+}
 
 function signStreamToken({ url, referer }) {
   const payload = { u: url, r: referer, e: Math.floor(Date.now() / 1000) + TOKEN_TTL_SEC };

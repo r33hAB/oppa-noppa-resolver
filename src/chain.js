@@ -1,18 +1,14 @@
-// Scraper chain. Tries anime.nexus first, falls back to miruro.
+// Scraper chain. Tries miruro first, falls back to anime.nexus.
 //
-// Rationale for anime.nexus primary:
-//   - Serves a clean HLS manifest directly from its CDN; no Playwright
-//     needed, no bot-wall-in-front-of-m3u8 to work around.
-//   - Audio is Opus in fMP4 — plays natively in hls.js + modern Safari.
-//     No ffmpeg remux step (unlike miruro's HE-AACv2) → no server CPU,
-//     no disk, no idle-reaper state.
-//   - Bundles sub + dub into one manifest as alternate audio renditions,
-//     so the same URL works for both languages (client picks track).
+// Miruro is primary because anime.nexus playback is currently unreliable
+// for our mobile client; miruro works end-to-end via the ffmpeg remux
+// session flow. anime.nexus stays in the chain as a fallback so shows
+// miruro can't resolve still get a shot at playing.
 //
-// Miruro only runs if anime.nexus returns null (show not in catalog, or
-// dub requested but not available). Miruro paths still require the
-// existing ffmpeg-session flow because its HE-AACv2 audio doesn't play
-// in Chrome/Firefox MSE.
+// Tradeoff: miruro requires the ffmpeg-session flow (HE-AACv2 → LC-AAC
+// remux for Chrome/Firefox MSE), so this is heavier on the server than
+// anime.nexus's direct-manifest path. Acceptable for now given the
+// reliability win.
 
 import { resolveFromAnilist as nexusResolve, probeAvailability as nexusProbe } from './scrapers/animenexus.js';
 
@@ -40,6 +36,21 @@ async function getMiruro() {
  */
 export async function resolveChain({ anilistId, ep, dub, log = console }) {
   try {
+    const { resolveMiruro } = await getMiruro();
+    const mir = await resolveMiruro({ anilistId, ep, dub });
+    if (mir) {
+      return {
+        provider: 'miruro',
+        needsTranscode: true,
+        upstreamUrl: mir.url,
+        referer: mir.referer ?? 'https://www.miruro.to/',
+      };
+    }
+  } catch (err) {
+    log.warn?.({ err: err.message, anilistId, ep, dub }, '[chain] miruro threw; trying animenexus');
+  }
+
+  try {
     const nexus = await nexusResolve({ anilistId, ep, dub });
     if (nexus) {
       return {
@@ -54,22 +65,7 @@ export async function resolveChain({ anilistId, ep, dub, log = console }) {
       };
     }
   } catch (err) {
-    log.warn?.({ err: err.message, anilistId, ep, dub }, '[chain] animenexus threw; trying miruro');
-  }
-
-  try {
-    const { resolveMiruro } = await getMiruro();
-    const mir = await resolveMiruro({ anilistId, ep, dub });
-    if (mir) {
-      return {
-        provider: 'miruro',
-        needsTranscode: true,
-        upstreamUrl: mir.url,
-        referer: mir.referer ?? 'https://www.miruro.to/',
-      };
-    }
-  } catch (err) {
-    log.warn?.({ err: err.message, anilistId, ep, dub }, '[chain] miruro threw');
+    log.warn?.({ err: err.message, anilistId, ep, dub }, '[chain] animenexus threw');
   }
 
   return null;
