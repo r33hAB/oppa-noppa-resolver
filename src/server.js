@@ -18,8 +18,9 @@ import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import crypto from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { resolveMiruro } from './scrapers/miruro.js';
+import { resolveChain, probeAvailability } from './chain.js';
 import { fetchAniList } from './anilist.js';
+import { tryKitsuFallback } from './anilist-kitsu-shim.js';
 import { startSession, readPlaylist, getSegmentPath, stopSession, ffmpegVersion } from './transcoder.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -70,8 +71,12 @@ app.get('/health', async () => ({ ok: true, ts: Date.now(), ffmpeg: await ffmpeg
 
 /**
  * Signed stream-URL generator. Response body is JSON with `url` that the
- * player can hand directly to <video>. The URL points at our own
- * `/stream/:token` proxy so Safari gets the right Referer injected.
+ * player can hand directly to <video> or hls.js. Behaviour now depends
+ * on which provider the chain picked:
+ *   - anime.nexus (primary) returns a direct manifest URL. The client
+ *     plays it natively — no proxy hop, no transcode.
+ *   - miruro (fallback) still routes through `/stream/:token` so we can
+ *     inject the Referer header Safari can't set from JS.
  */
 app.get('/resolve', async (req, reply) => {
   const q = req.query;
@@ -86,19 +91,51 @@ app.get('/resolve', async (req, reply) => {
   }
 
   try {
-    const tapped = await resolveMiruro({ anilistId, ep, dub });
-    if (!tapped) return reply.code(404).send({ error: 'no playable source' });
-    const token = signStreamToken({ url: tapped.url, referer: tapped.referer ?? '' });
-    // Absolute URL back to our own /stream proxy. The PWA doesn't need
-    // to know the upstream host — it just plays this.
+    const resolved = await resolveChain({ anilistId, ep, dub, log: req.log });
+    if (!resolved) return reply.code(404).send({ error: 'no playable source' });
+
+    if (resolved.provider === 'animenexus') {
+      // Manifest is publicly accessible; no signed proxy needed.
+      return {
+        url: resolved.directUrl,
+        provider: 'animenexus',
+        audioLanguages: resolved.audioLanguages,
+        subtitles: resolved.subtitles,
+        expiresAt: Date.now() + TOKEN_TTL_SEC * 1000,
+      };
+    }
+
+    // Miruro — sign and serve through our Referer-injecting proxy.
+    const token = signStreamToken({ url: resolved.upstreamUrl, referer: resolved.referer ?? '' });
     const proto = req.headers['x-forwarded-proto'] ?? req.protocol;
     const host = req.headers['x-forwarded-host'] ?? req.headers.host;
-    const proxyUrl = `${proto}://${host}/stream/${token}`;
-    return { url: proxyUrl, expiresAt: Date.now() + TOKEN_TTL_SEC * 1000 };
+    return {
+      url: `${proto}://${host}/stream/${token}`,
+      provider: 'miruro',
+      expiresAt: Date.now() + TOKEN_TTL_SEC * 1000,
+    };
   } catch (err) {
     req.log.error({ err: err.message }, 'resolve failed');
     return reply.code(502).send({ error: 'upstream failed', detail: err.message });
   }
+});
+
+/**
+ * Availability probe for the AnimePage DUB toggle. The mobile client
+ * calls this on load so it can disable DUB for shows/episodes that have
+ * no English audio, preventing the "click DUB, get sub-fallback" trap.
+ *
+ * Uses anime.nexus's per-episode `audio_languages` metadata. If nexus
+ * is unreachable, we default to both-available (optimistic) rather than
+ * breaking the toggle during provider outages.
+ */
+app.get('/availability', async (req, reply) => {
+  const anilistId = Number(req.query.anilistId);
+  const ep = Number(req.query.ep);
+  if (!Number.isInteger(anilistId) || anilistId <= 0) return reply.code(400).send({ error: 'bad anilistId' });
+  if (!Number.isInteger(ep) || ep <= 0) return reply.code(400).send({ error: 'bad ep' });
+  const a = await probeAvailability({ anilistId, ep, log: req.log });
+  return a;
 });
 
 /**
@@ -213,18 +250,35 @@ app.post('/session/start', async (req, reply) => {
   if (!Number.isInteger(anilistId) || anilistId <= 0) return reply.code(400).send({ error: 'bad anilistId' });
   if (!Number.isInteger(ep) || ep <= 0) return reply.code(400).send({ error: 'bad ep' });
 
-  let tapped;
+  let resolved;
   try {
-    tapped = await resolveMiruro({ anilistId, ep, dub });
+    resolved = await resolveChain({ anilistId, ep, dub, log: req.log });
   } catch (err) {
-    req.log.error({ err: err.message }, 'scrape failed');
-    return reply.code(502).send({ error: 'scrape failed', detail: err.message });
+    req.log.error({ err: err.message }, 'chain failed');
+    return reply.code(502).send({ error: 'chain failed', detail: err.message });
   }
-  if (!tapped) return reply.code(404).send({ error: 'no playable source' });
+  if (!resolved) return reply.code(404).send({ error: 'no playable source' });
 
+  // anime.nexus serves Opus-in-fMP4 that the browser can play directly;
+  // no ffmpeg session needed. We still return the same shape the mobile
+  // client expects so the existing watch flow doesn't care which
+  // provider won. Empty sessionId means "no teardown needed"; the
+  // client's /session/:id/stop call is a safe no-op for that.
+  if (!resolved.needsTranscode) {
+    return {
+      sessionId: '',
+      playlistUrl: resolved.directUrl,
+      provider: resolved.provider,
+      audioLanguages: resolved.audioLanguages,
+      subtitles: resolved.subtitles,
+    };
+  }
+
+  // Miruro path — remux HE-AACv2 → LC-AAC via ffmpeg so Chrome/Firefox
+  // MSE can decode the audio.
   let session;
   try {
-    session = await startSession({ upstreamUrl: tapped.url });
+    session = await startSession({ upstreamUrl: resolved.upstreamUrl });
   } catch (err) {
     req.log.error({ err: err.message }, 'session start failed');
     return reply.code(502).send({ error: 'transcoder failed', detail: err.message });
@@ -235,6 +289,7 @@ app.post('/session/start', async (req, reply) => {
   return {
     sessionId: session.id,
     playlistUrl: `${proto}://${host}/session/${session.id}/playlist.m3u8`,
+    provider: resolved.provider,
   };
 });
 
@@ -270,15 +325,59 @@ app.post('/session/:id/stop', async (req, reply) => {
 /**
  * AniList passthrough. Lets the PWA hit us (same-origin through CF) for
  * search/detail/schedule without re-registering as an AniList client.
- * We do not cache these; AniList's TTL is fine.
+ *
+ * Each successful response is cached in-memory keyed by the {query,
+ * variables} pair. When AniList itself is down (e.g. the 2026-04
+ * outage), we serve the last-known-good payload as a stale response so
+ * the PWA's home/search/library pages stay loadable instead of erroring.
+ * Stale responses include `_stale: true` so the client can choose to
+ * surface a banner if it cares. No persistence — Railway redeploys clear
+ * the cache, which is fine; the next cold call rewarms from AniList.
  */
+const anilistCache = new Map(); // key: JSON({query, variables}) → { data, fetchedAt }
+const ANILIST_CACHE_MAX = 500;
+
+function anilistCacheKey(query, variables) {
+  // Normalise query whitespace so equivalent calls share a cache slot.
+  return JSON.stringify({ q: query.replace(/\s+/g, ' ').trim(), v: variables ?? {} });
+}
+
 app.post('/anilist', async (req, reply) => {
   const { query, variables } = req.body ?? {};
   if (typeof query !== 'string') return reply.code(400).send({ error: 'missing query' });
+  const key = anilistCacheKey(query, variables);
   try {
     const data = await fetchAniList(query, variables ?? {});
+    anilistCache.set(key, { data, fetchedAt: Date.now() });
+    // Crude bounded-size eviction: drop the oldest insertion when we
+    // exceed the cap. Map preserves insertion order, so the first key
+    // is the oldest. Keeps memory predictable; we don't need true LRU.
+    if (anilistCache.size > ANILIST_CACHE_MAX) {
+      const oldest = anilistCache.keys().next().value;
+      if (oldest != null) anilistCache.delete(oldest);
+    }
     return data;
   } catch (err) {
+    // Layer 1: stale cache (most relevant data when AniList was last up).
+    const cached = anilistCache.get(key);
+    if (cached) {
+      req.log.warn({ err: err.message, ageSec: Math.round((Date.now() - cached.fetchedAt) / 1000) }, 'anilist failed; serving stale cache');
+      return { ...cached.data, _stale: true, _staleAgeSec: Math.round((Date.now() - cached.fetchedAt) / 1000) };
+    }
+    // Layer 2: Kitsu shim (when cache is cold but the query type is one
+    // we know how to translate — trending, seasonal, detail, search, batch).
+    try {
+      const fallback = await tryKitsuFallback(query, variables);
+      if (fallback) {
+        req.log.warn({ err: err.message }, 'anilist failed; serving Kitsu fallback');
+        // Cache the fallback under the same key so subsequent identical
+        // calls during the outage don't re-fan-out to Kitsu either.
+        anilistCache.set(key, { data: fallback, fetchedAt: Date.now() });
+        return { ...fallback, _stale: true, _fallback: 'kitsu' };
+      }
+    } catch (fbErr) {
+      req.log.warn({ err: fbErr.message }, 'kitsu fallback also failed');
+    }
     return reply.code(502).send({ error: err.message });
   }
 });
